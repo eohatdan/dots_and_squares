@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
 
 // --- Configuration ---
@@ -24,8 +25,6 @@ function createInitialState(rows, cols) {
 
 /**
  * Validates if a square at [r, c] is complete.
- * A square is defined by 4 lines: 
- * Top (H[r][c]), Bottom (H[r+1][c]), Left (V[r][c]), Right (V[r][c+1])
  */
 function checkSquareCompletion(r, c) {
     if (r < 0 || r >= gameState.rows || c < 0 || c >= gameState.cols) return false;
@@ -39,6 +38,19 @@ function checkSquareCompletion(r, c) {
     return top && bottom && left && right;
 }
 
+/**
+ * Helper to count sides of a square at [r, c]
+ */
+function getSquareSideCount(r, c) {
+    if (r < 0 || r >= gameState.rows || c < 0 || c >= gameState.cols) return -1;
+    let sides = 0;
+    if (gameState.horizontalLines[r][c]) sides++;
+    if (gameState.horizontalLines[r + 1][c]) sides++;
+    if (gameState.verticalLines[r][c]) sides++;
+    if (gameState.verticalLines[r][c + 1]) sides++;
+    return sides;
+}
+
 // --- Game Logic ---
 function handleMove(type, r, c) {
     if (gameState.isGameOver) return;
@@ -46,18 +58,15 @@ function handleMove(type, r, c) {
     const isH = type === 'h';
     const lines = isH ? gameState.horizontalLines : gameState.verticalLines;
 
-    // Boundary & Occupied validation
     if (isH) {
         if (r < 0 || r > gameState.rows || c < 0 || c >= gameState.cols || lines[r][c]) return;
     } else {
         if (r < 0 || r >= gameState.rows || c < 0 || c > gameState.cols || lines[r][c]) return;
     }
 
-    // Apply Move
     lines[r][c] = true;
     gameState.moveCount++;
 
-    // Check for completions
     let completedAny = false;
     const squaresToCheck = isH ? [[r - 1, c], [r, c]] : [[r, c - 1], [r, c]];
 
@@ -69,26 +78,28 @@ function handleMove(type, r, c) {
         }
     }
 
-    // Switch turn ONLY if no square was captured
     if (!completedAny) {
         gameState.currentPlayer = gameState.currentPlayer === 'PLAYER_1' ? 'PLAYER_2' : 'PLAYER_1';
     }
 
-    // Final check for Game Over
     gameState.isGameOver = gameState.squares.every(row => row.every(sq => sq !== null));
-    
     render();
     
-    // AI Trigger Logic
     if (gameState.currentPlayer === 'PLAYER_2' && !gameState.isGameOver && !isAiThinking) {
-        // Brief delay for visual continuity
-        setTimeout(triggerAi, 150);
+        setTimeout(triggerAi, 300);
     }
 }
 
 // --- Gemini AI Strategy Logic ---
-async function fetchAiMove(retryCount = 0) {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+async function fetchAiMove() {
+    // Safety check for API Key availability
+    const key = process.env.API_KEY;
+    if (!key || key === '') {
+        console.warn("API Key missing. Using local strategic engine.");
+        return null; // Trigger fallback
+    }
+
+    const ai = new GoogleGenAI({ apiKey: key });
     
     const availableMoves = [];
     for(let r=0; r<=gameState.rows; r++) for(let c=0; c<gameState.cols; c++) 
@@ -98,31 +109,22 @@ async function fetchAiMove(retryCount = 0) {
 
     if (availableMoves.length === 0) return null;
 
-    // Build a map of square health to help AI understand the board better
     const squareStats = [];
     for(let r=0; r<gameState.rows; r++) {
         for(let c=0; c<gameState.cols; c++) {
             if (gameState.squares[r][c]) continue;
-            let sides = 0;
-            if (gameState.horizontalLines[r][c]) sides++;
-            if (gameState.horizontalLines[r+1][c]) sides++;
-            if (gameState.verticalLines[r][c]) sides++;
-            if (gameState.verticalLines[r][c+1]) sides++;
-            squareStats.push({r, c, sides});
+            squareStats.push({r, c, sides: getSquareSideCount(r, c)});
         }
     }
 
     const prompt = `Dots & Squares. Grid ${gameState.rows}x${gameState.cols}. 
-BOARD ANALYSIS:
+BOARD ANALYSIS (Current square side counts):
 ${JSON.stringify(squareStats)}
 
 STRATEGY:
-1. If any square has 3 sides, COMPLETE IT.
-2. If no squares have 3 sides, place a line where the square has 0 or 1 sides.
-3. NEVER place the 3rd side of a square unless absolutely forced.
-
-Available moves: ${JSON.stringify(availableMoves.slice(0, 30))}.
-Return JSON move format: {"type": "h"|"v", "r": int, "c": int}`;
+1. If a square has 3 sides, COMPLETE it.
+2. Avoid placing a 3rd side (which lets opponent score).
+Return JSON: {"type": "h"|"v", "r": int, "c": int}`;
 
     try {
         const response = await ai.models.generateContent({
@@ -131,7 +133,7 @@ Return JSON move format: {"type": "h"|"v", "r": int, "c": int}`;
             config: {
                 thinkingConfig: { thinkingBudget: 800 },
                 temperature: 0,
-                maxOutputTokens: 1000, 
+                maxOutputTokens: 500, 
                 responseMimeType: "application/json",
                 responseSchema: {
                     type: Type.OBJECT,
@@ -147,14 +149,11 @@ Return JSON move format: {"type": "h"|"v", "r": int, "c": int}`;
 
         const move = JSON.parse(response.text);
         const lines = move.type === 'h' ? gameState.horizontalLines : gameState.verticalLines;
-        
-        if (lines[move.r] && lines[move.r][move.c] === false) {
-            return move;
-        }
-        return availableMoves[0];
+        if (lines[move.r] && lines[move.r][move.c] === false) return move;
+        return null;
     } catch (e) {
-        if (retryCount < 1) return fetchAiMove(retryCount + 1);
-        throw e;
+        console.error("Gemini API Error:", e);
+        return null;
     }
 }
 
@@ -163,23 +162,45 @@ async function triggerAi() {
     isAiThinking = true;
     render();
 
+    let move = null;
     try {
-        const move = await fetchAiMove();
-        isAiThinking = false;
-        if (move) {
-            handleMove(move.type, move.r, move.c);
-        }
-    } catch (e) {
-        console.error("AI Error:", e);
-        isAiThinking = false;
-        // Logical fallback to first available move
+        move = await fetchAiMove();
+    } catch (e) {}
+
+    // LOCAL STRATEGIC FALLBACK (Always kicks in if Gemini fails or Key is missing)
+    if (!move) {
         const moves = [];
         for(let r=0; r<=gameState.rows; r++) for(let c=0; c<gameState.cols; c++) 
             if(!gameState.horizontalLines[r][c]) moves.push({type:'h', r, c});
         for(let r=0; r<gameState.rows; r++) for(let c=0; c<=gameState.cols; c++) 
             if(!gameState.verticalLines[r][c]) moves.push({type:'v', r, c});
-        if (moves.length > 0) handleMove(moves[0].type, moves[0].r, moves[0].c);
+
+        // 1. Try to find a move that completes a square
+        for (const m of moves) {
+            const isH = m.type === 'h';
+            const squares = isH ? [[m.r - 1, m.c], [m.r, m.c]] : [[m.r, m.c - 1], [m.r, m.c]];
+            for (const [sqR, sqC] of squares) {
+                if (getSquareSideCount(sqR, sqC) === 3) {
+                    move = m;
+                    break;
+                }
+            }
+            if (move) break;
+        }
+
+        // 2. Otherwise pick one that doesn't create a 3rd side
+        if (!move) {
+            const safeMoves = moves.filter(m => {
+                const isH = m.type === 'h';
+                const squares = isH ? [[m.r - 1, m.c], [m.r, m.c]] : [[m.r, m.c - 1], [m.r, m.c]];
+                return squares.every(([sqR, sqC]) => getSquareSideCount(sqR, sqC) < 2);
+            });
+            move = safeMoves.length > 0 ? safeMoves[Math.floor(Math.random() * safeMoves.length)] : moves[0];
+        }
     }
+
+    isAiThinking = false;
+    if (move) handleMove(move.type, move.r, move.c);
 }
 
 // --- Rendering Engine ---
