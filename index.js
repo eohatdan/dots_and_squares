@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, Type } from "@google/genai";
 
 // --- Configuration ---
@@ -23,46 +22,11 @@ function createInitialState(rows, cols) {
     };
 }
 
-// --- Game Logic ---
-function handleMove(type, r, c) {
-    if (gameState.isGameOver) return;
-    if (isAiThinking && gameState.currentPlayer === 'PLAYER_1') return;
-
-    const isH = type === 'h';
-    const lines = isH ? gameState.horizontalLines : gameState.verticalLines;
-
-    if (isH) {
-        if (r < 0 || r > gameState.rows || c < 0 || c >= gameState.cols || lines[r][c]) return;
-    } else {
-        if (r < 0 || r >= gameState.rows || c < 0 || c > gameState.cols || lines[r][c]) return;
-    }
-
-    lines[r][c] = true;
-    gameState.moveCount++;
-
-    let completedAny = false;
-    const squaresToCheck = isH ? [[r - 1, c], [r, c]] : [[r, c - 1], [r, c]];
-
-    squaresToCheck.forEach(([sqR, sqC]) => {
-        if (checkSquareCompletion(sqR, sqC)) {
-            gameState.squares[sqR][sqC] = gameState.currentPlayer;
-            gameState.scores[gameState.currentPlayer] += 1;
-            completedAny = true;
-        }
-    });
-
-    if (!completedAny) {
-        gameState.currentPlayer = gameState.currentPlayer === 'PLAYER_1' ? 'PLAYER_2' : 'PLAYER_1';
-    }
-
-    gameState.isGameOver = gameState.squares.every(row => row.every(sq => sq !== null));
-    render();
-    
-    if (gameState.currentPlayer === 'PLAYER_2' && !gameState.isGameOver && !isAiThinking) {
-        triggerAi();
-    }
-}
-
+/**
+ * Validates if a square at [r, c] is complete.
+ * A square is defined by 4 lines: 
+ * Top (H[r][c]), Bottom (H[r+1][c]), Left (V[r][c]), Right (V[r][c+1])
+ */
 function checkSquareCompletion(r, c) {
     if (r < 0 || r >= gameState.rows || c < 0 || c >= gameState.cols) return false;
     if (gameState.squares[r][c] !== null) return false;
@@ -75,7 +39,54 @@ function checkSquareCompletion(r, c) {
     return top && bottom && left && right;
 }
 
-// --- Gemini AI Logic ---
+// --- Game Logic ---
+function handleMove(type, r, c) {
+    if (gameState.isGameOver) return;
+    
+    const isH = type === 'h';
+    const lines = isH ? gameState.horizontalLines : gameState.verticalLines;
+
+    // Boundary & Occupied validation
+    if (isH) {
+        if (r < 0 || r > gameState.rows || c < 0 || c >= gameState.cols || lines[r][c]) return;
+    } else {
+        if (r < 0 || r >= gameState.rows || c < 0 || c > gameState.cols || lines[r][c]) return;
+    }
+
+    // Apply Move
+    lines[r][c] = true;
+    gameState.moveCount++;
+
+    // Check for completions
+    let completedAny = false;
+    const squaresToCheck = isH ? [[r - 1, c], [r, c]] : [[r, c - 1], [r, c]];
+
+    for (const [sqR, sqC] of squaresToCheck) {
+        if (checkSquareCompletion(sqR, sqC)) {
+            gameState.squares[sqR][sqC] = gameState.currentPlayer;
+            gameState.scores[gameState.currentPlayer] += 1;
+            completedAny = true;
+        }
+    }
+
+    // Switch turn ONLY if no square was captured
+    if (!completedAny) {
+        gameState.currentPlayer = gameState.currentPlayer === 'PLAYER_1' ? 'PLAYER_2' : 'PLAYER_1';
+    }
+
+    // Final check for Game Over
+    gameState.isGameOver = gameState.squares.every(row => row.every(sq => sq !== null));
+    
+    render();
+    
+    // AI Trigger Logic
+    if (gameState.currentPlayer === 'PLAYER_2' && !gameState.isGameOver && !isAiThinking) {
+        // Brief delay for visual continuity
+        setTimeout(triggerAi, 150);
+    }
+}
+
+// --- Gemini AI Strategy Logic ---
 async function fetchAiMove(retryCount = 0) {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
@@ -87,27 +98,40 @@ async function fetchAiMove(retryCount = 0) {
 
     if (availableMoves.length === 0) return null;
 
-    // Compact representation to save tokens and speed up inference
-    const hCompact = gameState.horizontalLines.map(row => row.map(v => v ? 1 : 0));
-    const vCompact = gameState.verticalLines.map(row => row.map(v => v ? 1 : 0));
+    // Build a map of square health to help AI understand the board better
+    const squareStats = [];
+    for(let r=0; r<gameState.rows; r++) {
+        for(let c=0; c<gameState.cols; c++) {
+            if (gameState.squares[r][c]) continue;
+            let sides = 0;
+            if (gameState.horizontalLines[r][c]) sides++;
+            if (gameState.horizontalLines[r+1][c]) sides++;
+            if (gameState.verticalLines[r][c]) sides++;
+            if (gameState.verticalLines[r][c+1]) sides++;
+            squareStats.push({r, c, sides});
+        }
+    }
 
-    const prompt = `Dots and Squares game. 
-Board: Horizontal lines (1=exists): ${JSON.stringify(hCompact)}. Vertical lines (1=exists): ${JSON.stringify(vCompact)}.
-Strategy:
-1. COMPLETE any square with 3 sides.
-2. DO NOT create a 3rd side for your opponent unless forced.
-Moves available: ${JSON.stringify(availableMoves.slice(0, 35))}. 
-Return JSON move.`;
+    const prompt = `Dots & Squares. Grid ${gameState.rows}x${gameState.cols}. 
+BOARD ANALYSIS:
+${JSON.stringify(squareStats)}
+
+STRATEGY:
+1. If any square has 3 sides, COMPLETE IT.
+2. If no squares have 3 sides, place a line where the square has 0 or 1 sides.
+3. NEVER place the 3rd side of a square unless absolutely forced.
+
+Available moves: ${JSON.stringify(availableMoves.slice(0, 30))}.
+Return JSON move format: {"type": "h"|"v", "r": int, "c": int}`;
 
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-3-flash-preview',
             contents: prompt,
             config: {
-                // Reduced thinking budget for faster response while keeping intelligence
-                thinkingConfig: { thinkingBudget: 1000 },
+                thinkingConfig: { thinkingBudget: 800 },
                 temperature: 0,
-                maxOutputTokens: 1200, 
+                maxOutputTokens: 1000, 
                 responseMimeType: "application/json",
                 responseSchema: {
                     type: Type.OBJECT,
@@ -126,9 +150,8 @@ Return JSON move.`;
         
         if (lines[move.r] && lines[move.r][move.c] === false) {
             return move;
-        } else {
-            return availableMoves[0];
         }
+        return availableMoves[0];
     } catch (e) {
         if (retryCount < 1) return fetchAiMove(retryCount + 1);
         throw e;
@@ -136,6 +159,7 @@ Return JSON move.`;
 }
 
 async function triggerAi() {
+    if (isAiThinking) return;
     isAiThinking = true;
     render();
 
@@ -148,19 +172,17 @@ async function triggerAi() {
     } catch (e) {
         console.error("AI Error:", e);
         isAiThinking = false;
+        // Logical fallback to first available move
         const moves = [];
         for(let r=0; r<=gameState.rows; r++) for(let c=0; c<gameState.cols; c++) 
             if(!gameState.horizontalLines[r][c]) moves.push({type:'h', r, c});
         for(let r=0; r<gameState.rows; r++) for(let c=0; c<=gameState.cols; c++) 
             if(!gameState.verticalLines[r][c]) moves.push({type:'v', r, c});
-        if (moves.length > 0) {
-            const randomMove = moves[Math.floor(Math.random() * moves.length)];
-            handleMove(randomMove.type, randomMove.r, randomMove.c);
-        }
+        if (moves.length > 0) handleMove(moves[0].type, moves[0].r, moves[0].c);
     }
 }
 
-// --- Rendering ---
+// --- Rendering Engine ---
 const gridEl = document.getElementById('game-grid');
 
 function render() {
@@ -185,27 +207,32 @@ function render() {
     gridEl.style.height = `${gameState.rows * CELL_SIZE}px`;
     
     let html = '';
+    
+    // 1. Render Captured Squares
     gameState.squares.forEach((row, r) => row.forEach((owner, c) => {
         if (owner) {
-            html += `<div class="absolute w-[64px] h-[64px] flex items-center justify-center transition-all duration-700 animate-in fade-in zoom-in-75 ${owner === 'PLAYER_1' ? 'bg-blue-50/50' : 'bg-indigo-50/50'}" style="top:${r*CELL_SIZE}px; left:${c*CELL_SIZE}px;"><div class="w-8 h-8 rounded-xl flex items-center justify-center font-black text-xs shadow-sm bg-${owner === 'PLAYER_1' ? 'blue' : 'indigo'}-500 text-white">${owner === 'PLAYER_1' ? 'P' : 'A'}</div></div>`;
+            html += `<div class="absolute w-[64px] h-[64px] flex items-center justify-center transition-all duration-500 animate-in zoom-in-50 ${owner === 'PLAYER_1' ? 'bg-blue-50/40' : 'bg-indigo-50/40'}" style="top:${r*CELL_SIZE}px; left:${c*CELL_SIZE}px;"><div class="w-8 h-8 rounded-xl flex items-center justify-center font-black text-xs shadow-sm bg-${owner === 'PLAYER_1' ? 'blue' : 'indigo'}-500 text-white">${owner === 'PLAYER_1' ? 'P' : 'A'}</div></div>`;
         }
     }));
 
+    // 2. Render Lines
     gameState.horizontalLines.forEach((row, r) => row.forEach((active, c) => {
         const canClick = !active && isP1 && !isAiThinking && !gameState.isGameOver;
-        html += `<button class="line-btn line-h absolute h-1.5 z-20 transition-all rounded-full ${active ? 'bg-slate-800 shadow-sm' : 'bg-slate-100 hover:bg-slate-300'}" style="width:64px; top:${r*CELL_SIZE-3}px; left:${c*CELL_SIZE}px" onclick="window.makeMove('h', ${r}, ${c})" ${!canClick ? 'disabled' : ''}></button>`;
+        html += `<button class="line-btn line-h absolute h-1.5 z-20 transition-all rounded-full ${active ? 'bg-slate-800' : 'bg-slate-100 hover:bg-slate-300'}" style="width:64px; top:${r*CELL_SIZE-3}px; left:${c*CELL_SIZE}px" onclick="window.makeMove('h', ${r}, ${c})" ${!canClick ? 'disabled' : ''}></button>`;
     }));
 
     gameState.verticalLines.forEach((row, r) => row.forEach((active, c) => {
         const canClick = !active && isP1 && !isAiThinking && !gameState.isGameOver;
-        html += `<button class="line-btn line-v absolute w-1.5 z-20 transition-all rounded-full ${active ? 'bg-slate-800 shadow-sm' : 'bg-slate-100 hover:bg-slate-300'}" style="height:64px; top:${r*CELL_SIZE}px; left:${c*CELL_SIZE-3}px" onclick="window.makeMove('v', ${r}, ${c})" ${!canClick ? 'disabled' : ''}></button>`;
+        html += `<button class="line-btn line-v absolute w-1.5 z-20 transition-all rounded-full ${active ? 'bg-slate-800' : 'bg-slate-100 hover:bg-slate-300'}" style="height:64px; top:${r*CELL_SIZE}px; left:${c*CELL_SIZE-3}px" onclick="window.makeMove('v', ${r}, ${c})" ${!canClick ? 'disabled' : ''}></button>`;
     }));
 
+    // 3. Render Dots
     for(let r=0; r<=gameState.rows; r++) {
         for(let c=0; c<=gameState.cols; c++) {
-            html += `<div class="absolute w-3.5 h-3.5 bg-slate-300 rounded-full z-30 border-2 border-white shadow-sm ring-1 ring-slate-100" style="top:${r*CELL_SIZE-7}px; left:${c*CELL_SIZE-7}px"></div>`;
+            html += `<div class="absolute w-3 h-3 bg-slate-300 rounded-full z-30 border-2 border-white shadow-sm" style="top:${r*CELL_SIZE-6}px; left:${c*CELL_SIZE-6}px"></div>`;
         }
     }
+    
     gridEl.innerHTML = html;
     if (window.lucide) window.lucide.createIcons();
     if (gameState.isGameOver) showGameOver();
@@ -231,7 +258,6 @@ document.getElementById('btn-play-again').onclick = () => {
 
 document.getElementById('btn-save').onclick = () => {
     localStorage.setItem('dots_game_v1', JSON.stringify(gameState));
-    render();
 };
 
 document.getElementById('btn-restore').onclick = () => {
